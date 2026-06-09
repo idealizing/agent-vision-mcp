@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "agent-vision-mcp": {
+      "type": "stdio",
+      "command": "/data/mcp/agent-vision-mcp/.venv/bin/python",
+      "args": ["-m", "agent_vision_mcp.server"],
+      "env": {
+        "VISION_API_KEY": "${VISION_API_KEY}",
+        "VISION_BASE_URL": "${VISION_BASE_URL}",
+        "VISION_MODEL_ID": "${VISION_MODEL_ID}",
+        "VISION_PROVIDER": "openai-compatible",
+        "VISION_URL_MODE": "auto",
+        "VISION_TRANSPORT": "stdio"
+      }
+    }
+  }
+}

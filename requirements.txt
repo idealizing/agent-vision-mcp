@@ -1,0 +1,7 @@
+mcp>=1.0
+openai
+langchain-openai
+python-dotenv
+pydantic
+pillow
+httpx

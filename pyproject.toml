@@ -1,0 +1,47 @@
+[project]
+name = "agent-vision-mcp"
+version = "0.0.1"
+description = "Universal vision tools for AI agents via Model Context Protocol"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["mcp", "vision", "vlm", "ocr", "image-analysis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "mcp>=1.0",
+    "openai",
+    "langchain-openai",
+    "python-dotenv",
+    "pydantic",
+    "pillow",
+    "httpx",
+]
+
+[project.urls]
+Homepage = "https://github.com/idealizing/agent-vision-mcp"
+Repository = "https://github.com/idealizing/agent-vision-mcp"
+Issues = "https://github.com/idealizing/agent-vision-mcp/issues"
+
+[project.scripts]
+agent-vision-mcp = "agent_vision_mcp.server:run_server"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
