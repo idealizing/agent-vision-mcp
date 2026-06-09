@@ -470,7 +470,7 @@ def vision_capabilities() -> str:
     """Return server capabilities."""
     capabilities = {
         "server": "agent-vision-mcp",
-        "version": "0.0.1",
+        "version": "0.0.2",
         "vlm_provider": vlm_provider.get_capabilities(),
         "ocr_provider": ocr_provider.get_capabilities() if ocr_provider else None,
         "ocr_enabled": settings.ocr_enabled,
