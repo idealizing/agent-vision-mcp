@@ -93,7 +93,10 @@ class VisionAnalyzeEnvelopeTest(unittest.TestCase):
 
     def test_invalid_input_returns_failure_envelope(self) -> None:
         self._patch_vlm()
-        out = server.vision_analyze(image_source="not-a-real-image", task="ui")
+        out = server.vision_analyze(
+            image_source="data:image/png;base64,SGVsbG8=",
+            task="ui",
+        )
         parsed = ResponseEnvelopeAdapter.validate_json(out)
         self.assertIsInstance(parsed, FailureEnvelope)
         self.assertEqual(parsed.tool, "vision_analyze")
