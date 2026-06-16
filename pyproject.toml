@@ -1,6 +1,6 @@
 [project]
 name = "agent-vision-mcp"
-version = "0.0.2"
+version = "0.0.3"
 description = "Universal vision tools for AI agents via Model Context Protocol"
 readme = "README.md"
 license = "MIT"
