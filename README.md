@@ -2,6 +2,8 @@
 
 <!-- mcp-name: io.github.idealizing/agent-vision-mcp -->
 
+[English](README.md) | [中文](README_CN.md)
+
 Give MCP-compatible AI agents image analysis, metadata inspection, cropping,
 OCR, and image comparison through any OpenAI-compatible vision model.
 
@@ -128,6 +130,115 @@ Use this stdio configuration with MCP clients that accept JSON configuration:
 | `vision_extract_text` | Extract visible text using OCR or the VLM |
 | `vision_compare` | Compare two to four images |
 | `vision_capabilities` | Show server configuration and limits |
+
+## Response format
+
+Every tool returns a JSON string. Clients must `json.loads` the result
+before reading any field. All top-level keys are always present (even when
+empty), so consumers can iterate the envelope without `dict.get(...)`
+guards.
+
+### Success envelope
+
+```json
+{
+  "schema_version": "1.0",
+  "ok": true,
+  "tool": "vision_analyze",
+  "task": "general",
+  "model": "...",
+  "source": null,
+  "sources": [],
+  "result": {},
+  "warnings": [],
+  "raw_model_output": null,
+  "error": null
+}
+```
+
+| Field | Type | When set |
+| --- | --- | --- |
+| `schema_version` | `string` | Always. Currently `"1.0"`. |
+| `ok` | `bool` | Always. `true` on success, `false` on failure. |
+| `tool` | `string` | Always. The tool name (e.g. `vision_analyze`). |
+| `task` | `string \| null` | The `task` argument when the tool takes one; `null` for `vision_capabilities` and `vision_extract_text`. |
+| `model` | `string \| null` | The configured model identifier (e.g. `glm-4v-flash`). Set even on failure when the tool knew it. |
+| `source` | `SourceMeta \| null` | Single-image tools. `null` for `vision_compare` and `vision_capabilities`. |
+| `sources` | `SourceMeta[]` | `vision_compare` only: one entry per input image. Empty for all other tools. |
+| `result` | `object` | Tool-specific (see below). `null` on failure. |
+| `warnings` | `string[]` | Always a list (empty on success). Soft-failure notes (e.g. `vision_extract_text` falling back from OCR to VLM). |
+| `raw_model_output` | `object \| null` | Sanitized provider response when `include_raw=true`; `null` otherwise. |
+| `error` | `ErrorPayload \| null` | `null` on success. Populated on failure. |
+
+`SourceMeta` fields: `type` (`url` / `file` / `data_url` / `base64`),
+`mime_type`, `width`, `height`, `size_bytes`, `source_ref` (only when
+`include_source_ref=true`; redacted to `host/path` for URLs or `basename`
+for files; `null` for data URLs and base64).
+
+### Failure envelope
+
+```json
+{
+  "schema_version": "1.0",
+  "ok": false,
+  "tool": "vision_analyze",
+  "task": "general",
+  "model": "...",
+  "source": null,
+  "sources": [],
+  "result": null,
+  "warnings": [],
+  "raw_model_output": null,
+  "error": {
+    "code": "INVALID_INPUT",
+    "message": "Input is not a valid supported image",
+    "retryable": false,
+    "details": {}
+  }
+}
+```
+
+`error.code` values: `INVALID_INPUT`, `IMAGE_TOO_LARGE`, `UNSUPPORTED_FORMAT`,
+`SECURITY_ERROR`, `PROVIDER_ERROR`, `TIMEOUT`, `INTERNAL_ERROR`.
+`retryable=true` means the caller may try the same call again.
+
+### Per-tool `result` shape
+
+| Tool | `result` keys |
+| --- | --- |
+| `vision_analyze` | `summary`, `observations[]`, `inferences[]`, `uncertainties[]`, `suggested_followups[]` |
+| `vision_extract_text` | `text`, `blocks[]`, `layout_preserved`, `unclear_segments[]` |
+| `vision_compare` | `summary`, `differences[]`, `same_elements[]` |
+| `vision_crop_analyze` | `crop: {x, y, width, height}`, `summary`, `observations[]` |
+| `vision_inspect` | `width`, `height`, `format`, `mime_type`, `mode`, `size_bytes`, `has_transparency`, `source_type` |
+| `vision_capabilities` | `server`, `version`, `vlm_provider`, `ocr_provider`, `ocr_enabled`, `tools`, `supports`, `limits`, `task_types` |
+
+Arrays that are not yet parsed from model output are returned as empty
+arrays (no fabricated structure). `observations`, `inferences`, and
+`differences` are empty in the current release; only `summary` carries
+the model's free-form text.
+
+### Multi-image input
+
+`vision_compare` accepts 2–4 images. The envelope reports them in
+`sources: [SourceMeta, ...]` (one entry per input, in input order).
+`source` is `null` for multi-image tools. All other image tools accept a
+single image and use `source`; `sources` is `[]`.
+
+### Opt-in flags
+
+- `include_raw: bool = False` — when `true`, `raw_model_output` contains a
+  sanitized subset of the provider response:
+  `{model, response_metadata: {model_name, finish_reason, system_fingerprint},
+   usage_metadata: {input_tokens, output_tokens, total_tokens}}`. HTTP
+  headers, request IDs, signed URLs, and raw exception text are dropped
+  before reaching the envelope. Off by default to keep responses small
+  and to avoid leaking auth material.
+- `include_source_ref: bool = False` — when `true`, `source.source_ref`
+  is populated with a redacted reference: `host/path` for URLs (query
+  string stripped, including signed tokens) or `basename` for local
+  files. `data_url` and base64 inputs always return `null` for
+  `source_ref`. Off by default to avoid leaking paths and signed URLs.
 
 ## URL Handling
 

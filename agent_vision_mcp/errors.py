@@ -3,6 +3,8 @@
 from typing import Optional, Any
 import json
 
+from agent_vision_mcp.responses import make_error_envelope
+
 
 class VisionMCPError(Exception):
     """Base exception for agent-vision-mcp"""
@@ -32,6 +34,31 @@ class VisionMCPError(Exception):
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False)
+
+    def to_envelope(
+        self,
+        *,
+        tool: str,
+        task: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> str:
+        """Build a failure-envelope JSON string tagged with this error.
+
+        Args:
+            tool: Name of the tool that raised the error (e.g. "vision_analyze").
+            task: Optional task type (e.g. "ui"). The tool sets this when known.
+            model: Optional configured model identifier. The tool sets this
+                when known, so the envelope reports it even on failure.
+        """
+        return make_error_envelope(
+            tool=tool,
+            code=self.code,
+            message=self.message,
+            retryable=self.retryable,
+            details=self.details,
+            task=task,
+            model=model,
+        )
 
 
 class InvalidInputError(VisionMCPError):
@@ -91,16 +118,32 @@ class TimeoutError(VisionMCPError):
         )
 
 
-def handle_exception(e: Exception) -> str:
-    """Convert exception to JSON error response"""
-    if isinstance(e, VisionMCPError):
-        return e.to_json()
+def handle_exception(
+    e: Exception,
+    *,
+    tool: str,
+    task: Optional[str] = None,
+    model: Optional[str] = None,
+) -> str:
+    """Convert an exception to a failure-envelope JSON string.
 
-    # Unknown error
+    For `VisionMCPError` instances, the error's own code/message/retryable
+    fields are preserved. For unknown exceptions, the envelope is built with
+    `code="INTERNAL_ERROR"` and the exception's class name in `details`.
+
+    Args:
+        e: The exception that was caught.
+        tool: Name of the tool that caught the error.
+        task: Optional task type (e.g. "ui").
+        model: Optional configured model identifier.
+    """
+    if isinstance(e, VisionMCPError):
+        return e.to_envelope(tool=tool, task=task, model=model)
+
     error = VisionMCPError(
         message="Internal error occurred",
         code="INTERNAL_ERROR",
         retryable=False,
         details={"type": type(e).__name__},
     )
-    return error.to_json()
+    return error.to_envelope(tool=tool, task=task, model=model)

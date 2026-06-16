@@ -94,8 +94,10 @@ def get_mime_type_from_extension(path: str) -> Optional[str]:
     return mime_type
 
 
-def normalize_data_url(source: str, max_pixels: int = 40_000_000) -> Tuple[str, str]:
-    """Normalize data URL to standard format"""
+def normalize_data_url(
+    source: str, max_pixels: int = 40_000_000
+) -> Tuple[str, str, int, int]:
+    """Normalize data URL to standard format. Returns (mime, data_url, width, height)."""
     match = DATA_URL_REGEX.match(source.strip())
     if not match:
         raise InvalidInputError("Invalid data URL format")
@@ -122,13 +124,15 @@ def normalize_data_url(source: str, max_pixels: int = 40_000_000) -> Tuple[str, 
     except (binascii.Error, ValueError):
         raise InvalidInputError("Invalid base64 data in data URL")
 
-    actual_mime = validate_image_bytes(data, max_pixels=max_pixels)
+    actual_mime, width, height = validate_image_bytes(data, max_pixels=max_pixels)
     data_url = f"data:{actual_mime};base64,{base64.b64encode(data).decode('ascii')}"
-    return actual_mime, data_url
+    return actual_mime, data_url, width, height
 
 
-def normalize_base64(source: str, max_pixels: int = 40_000_000) -> Tuple[str, str]:
-    """Normalize bare base64 to data URL"""
+def normalize_base64(
+    source: str, max_pixels: int = 40_000_000
+) -> Tuple[str, str, int, int]:
+    """Normalize bare base64 to data URL. Returns (mime, data_url, width, height)."""
     source = source.strip()
 
     # Remove any whitespace
@@ -139,14 +143,16 @@ def normalize_base64(source: str, max_pixels: int = 40_000_000) -> Tuple[str, st
     except (binascii.Error, ValueError):
         raise InvalidInputError("Invalid base64 image data")
 
-    mime_type = validate_image_bytes(data, max_pixels=max_pixels)
+    mime_type, width, height = validate_image_bytes(data, max_pixels=max_pixels)
     data_url = f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
 
-    return mime_type, data_url
+    return mime_type, data_url, width, height
 
 
-def validate_image_bytes(data: bytes, max_pixels: int = 40_000_000) -> str:
-    """Verify image bytes and return the MIME type detected from the content."""
+def validate_image_bytes(
+    data: bytes, max_pixels: int = 40_000_000
+) -> Tuple[str, int, int]:
+    """Verify image bytes and return (mime_type, width, height)."""
     try:
         with Image.open(io.BytesIO(data)) as image:
             width, height = image.size
@@ -164,7 +170,7 @@ def validate_image_bytes(data: bytes, max_pixels: int = 40_000_000) -> str:
     mime_type = FORMAT_TO_MIME.get(image_format or "")
     if not mime_type:
         raise UnsupportedFormatError(image_format or "unknown", list(FORMAT_TO_MIME))
-    return mime_type
+    return mime_type, width, height
 
 
 def normalize_url(
@@ -172,8 +178,11 @@ def normalize_url(
     max_size_mb: int = 10,
     max_pixels: int = 40_000_000,
     block_private_ips: bool = True,
-) -> Tuple[str, str]:
-    """Securely download a URL and convert the verified image to base64."""
+) -> Tuple[str, str, int, int, int]:
+    """Securely download a URL and convert the verified image to base64.
+
+    Returns (mime, data_url, width, height, size_bytes).
+    """
     source = source.strip()
     parsed = urlparse(source)
 
@@ -218,19 +227,19 @@ def normalize_url(
     except httpx.HTTPError as e:
         raise InvalidInputError(f"Failed to download image: {str(e)}")
 
-    content_type = validate_image_bytes(content, max_pixels=max_pixels)
+    content_type, width, height = validate_image_bytes(content, max_pixels=max_pixels)
     b64_data = base64.b64encode(content).decode("utf-8")
     data_url = f"data:{content_type};base64,{b64_data}"
 
-    return content_type, data_url
+    return content_type, data_url, width, height, size_bytes
 
 
 def normalize_file(
     source: str,
     max_size_mb: int = 10,
     max_pixels: int = 40_000_000,
-) -> Tuple[str, str]:
-    """Normalize file path to data URL"""
+) -> Tuple[str, str, int, int, int]:
+    """Normalize file path to data URL. Returns (mime, data_url, width, height, size_bytes)."""
     # Remove file:// prefix if present
     if source.lower().startswith("file://"):
         source = source[7:]  # Remove "file://"
@@ -255,11 +264,11 @@ def normalize_file(
     except PermissionError:
         raise InvalidInputError(f"Permission denied: {path}")
 
-    mime_type = validate_image_bytes(data, max_pixels=max_pixels)
+    mime_type, width, height = validate_image_bytes(data, max_pixels=max_pixels)
     base64_data = base64.b64encode(data).decode("utf-8")
     data_url = f"data:{mime_type};base64,{base64_data}"
 
-    return mime_type, data_url
+    return mime_type, data_url, width, height, size_bytes
 
 
 def normalize_image_source(
@@ -286,7 +295,10 @@ def normalize_image_source(
     """
     source = source.strip()
     source_type = detect_source_type(source)
-    size_bytes = None
+    size_bytes: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    mime_type: str = ""
 
     # Reject oversized encoded inputs before allocating decoded image bytes.
     if source_type in ("data_url", "base64"):
@@ -303,10 +315,14 @@ def normalize_image_source(
             raise ImageTooLargeError(size_mb, max_size_mb)
 
     if source_type == "data_url":
-        mime_type, data_url = normalize_data_url(source, max_pixels=max_pixels)
+        mime_type, data_url, width, height = normalize_data_url(
+            source, max_pixels=max_pixels
+        )
 
     elif source_type == "base64":
-        mime_type, data_url = normalize_base64(source, max_pixels=max_pixels)
+        mime_type, data_url, width, height = normalize_base64(
+            source, max_pixels=max_pixels
+        )
 
     elif source_type == "url":
         if url_mode == "passthrough":
@@ -316,7 +332,7 @@ def normalize_image_source(
                 data_url=source,
                 original_source=source,
             )
-        mime_type, data_url = normalize_url(
+        mime_type, data_url, width, height, size_bytes = normalize_url(
             source,
             max_size_mb=max_size_mb,
             max_pixels=max_pixels,
@@ -324,7 +340,9 @@ def normalize_image_source(
         )
 
     elif source_type == "file":
-        mime_type, data_url = normalize_file(source, max_size_mb, max_pixels)
+        mime_type, data_url, width, height, size_bytes = normalize_file(
+            source, max_size_mb, max_pixels
+        )
 
     else:
         raise InvalidInputError(f"Unknown source type: {source_type}")
@@ -333,6 +351,8 @@ def normalize_image_source(
         source_type=source_type,
         mime_type=mime_type,
         data_url=data_url,
+        width=width,
+        height=height,
         size_bytes=size_bytes,
         original_source=source,
     )

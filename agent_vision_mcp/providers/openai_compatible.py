@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage
 from agent_vision_mcp.config import Settings
 from agent_vision_mcp.errors import ProviderError, TimeoutError
 from agent_vision_mcp.providers.base import BaseVisionProvider
+from agent_vision_mcp.provider_result import ProviderResult, build_provider_result
 
 
 class OpenAICompatibleVisionProvider(BaseVisionProvider):
@@ -45,9 +46,12 @@ class OpenAICompatibleVisionProvider(BaseVisionProvider):
         prompt: str,
         detail: str = "auto",
         max_tokens: Optional[int] = None,
-    ) -> str:
+    ) -> ProviderResult:
         """
         Analyze images with a text prompt using langchain + OpenAI-compatible API.
+
+        Returns a sanitized ProviderResult — only whitelisted response_metadata
+        and usage_metadata keys cross this boundary.
         """
         content = [{"type": "text", "text": prompt}]
 
@@ -66,7 +70,12 @@ class OpenAICompatibleVisionProvider(BaseVisionProvider):
                     [message],
                     max_tokens=max_tokens or 2048,
                 )
-                return response.content or ""
+                return build_provider_result(
+                    text=response.content or "",
+                    model=self.model_id,
+                    response_metadata=getattr(response, "response_metadata", None),
+                    usage_metadata=getattr(response, "usage_metadata", None),
+                )
 
             except Exception as e:
                 error_str = str(e).lower()

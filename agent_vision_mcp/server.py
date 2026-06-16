@@ -7,16 +7,31 @@ import os
 import sys
 from pathlib import Path
 from typing import Annotated, Optional
+from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 from PIL import Image
 
 from agent_vision_mcp.config import Settings
 from agent_vision_mcp.errors import handle_exception, InvalidInputError, VisionMCPError, SecurityError
-from agent_vision_mcp.image.input import normalize_image_source, detect_source_type
+from agent_vision_mcp.image.input import NormalizedImage, normalize_image_source, detect_source_type
 from agent_vision_mcp.image.security import validate_image_source
 from agent_vision_mcp.providers.openai_compatible import OpenAICompatibleVisionProvider
 from agent_vision_mcp.providers.ocr_provider import OCRProvider
+from agent_vision_mcp.provider_result import ProviderResult
+from agent_vision_mcp.responses import (
+    CropRegion,
+    SourceMeta,
+    TextBlock,
+    VisionAnalyzeResult,
+    VisionCapabilitiesResult,
+    VisionCompareResult,
+    VisionCropAnalyzeResult,
+    VisionExtractTextResult,
+    VisionInspectResult,
+    make_envelope,
+    make_error_envelope,
+)
 
 # Initialize settings and providers
 settings = Settings.from_env()
@@ -51,28 +66,6 @@ def build_prompt(user_prompt: str, task: str) -> str:
     if user_prompt and user_prompt != TASK_PROMPTS.get("general", ""):
         return f"{task_instruction}\n\n用户具体问题：{user_prompt}"
     return task_instruction
-
-
-def format_structured_output(
-    summary: str,
-    observations: list = None,
-    extracted_text: list = None,
-    uncertainties: list = None,
-    suggested_followups: list = None,
-) -> str:
-    """Format output as structured JSON."""
-    result = {
-        "summary": summary,
-    }
-    if observations:
-        result["observations"] = observations
-    if extracted_text:
-        result["extracted_text"] = extracted_text
-    if uncertainties:
-        result["uncertainties"] = uncertainties
-    if suggested_followups:
-        result["suggested_followups"] = suggested_followups
-    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 def load_and_validate_image(image_source: str, require_bytes: bool = False) -> tuple:
@@ -188,15 +181,70 @@ def get_image_metadata(image_source: str) -> dict:
         "mode": img.mode,
         "size_bytes": len(image_data),
         "has_transparency": img.mode in ("RGBA", "PA", "LA"),
+        "source_type": source_type,
     }
+
+
+# ==================== Source metadata redaction ====================
+
+
+def _build_source_ref(normalized: NormalizedImage) -> str | None:
+    """Return a redacted `source_ref` string for the envelope, or None.
+
+    - url: netloc + path, with query string stripped (no signed tokens leak).
+    - file: basename only (no full path).
+    - data_url / base64: None (no safe representation).
+    """
+    if normalized.source_type == "url":
+        parsed = urlparse(normalized.original_source)
+        if not parsed.netloc:
+            return None
+        return f"{parsed.netloc}{parsed.path}"
+    if normalized.source_type == "file":
+        return Path(normalized.original_source).name or None
+    return None
+
+
+def _build_source_meta(
+    normalized: NormalizedImage, *, include_source_ref: bool = False
+) -> SourceMeta:
+    """Build a SourceMeta from a NormalizedImage.
+
+    The passthrough URL mode produces mime_type="" with no width/height/size_bytes;
+    those are surfaced as None so the envelope is honest about the gap.
+    """
+    mime_type = normalized.mime_type or None
+    return SourceMeta(
+        type=normalized.source_type,  # type: ignore[arg-type]
+        mime_type=mime_type,
+        width=normalized.width,
+        height=normalized.height,
+        size_bytes=normalized.size_bytes,
+        source_ref=_build_source_ref(normalized) if include_source_ref else None,
+    )
+
+
+def _provider_result_to_envelope_payload(
+    pr: ProviderResult, *, include_raw: bool
+) -> dict | None:
+    """Build the envelope's `raw_model_output` payload, or None when disabled.
+
+    `pr.model_dump(mode="json")` produces a sanitized dict (already passed
+    through the whitelist when the provider used `build_provider_result`).
+    """
+    if not include_raw:
+        return None
+    return pr.model_dump(mode="json")
 
 
 # ==================== MCP Tools ====================
 
+
 @mcp.tool(
     description=(
-        "Analyze an image using a vision-language model. Returns structured JSON with "
-        "summary, observations, extracted text, uncertainties, and suggested follow-ups.\n\n"
+        "Analyze an image using a vision-language model. Returns a unified JSON "
+        "envelope wrapping summary, observations, uncertainties, and suggested "
+        "follow-ups (see README 'Response format' for the full schema).\n\n"
         "Supports URL, local file path, data URL, and Base64 input.\n\n"
         "Task types guide the model:\n"
         "- general: General analysis (default)\n"
@@ -214,23 +262,26 @@ def vision_analyze(
     prompt: Annotated[str, "Your question or instruction about the image"] = "请描述这张图片的内容。",
     task: Annotated[str, "Task type: general/qa/ui/chart/document/object/screenshot/code_screenshot"] = "general",
     detail: Annotated[str, "Detail level: auto/low/high"] = "auto",
+    include_raw: Annotated[bool, "Include the sanitized provider response in `raw_model_output`"] = False,
+    include_source_ref: Annotated[bool, "Include a redacted `source_ref` (URL netloc+path or file basename) in the source block"] = False,
 ) -> str:
     """Analyze an image with structured output."""
+    tool = "vision_analyze"
+    model = vlm_provider.model_id
     try:
         validate_choice(task, TASK_TYPES, "task")
         validate_choice(detail, DETAIL_LEVELS, "detail")
         normalized, _ = load_and_validate_image(image_source)
         effective_prompt = build_prompt(prompt, task)
 
-        result = vlm_provider.analyze(
+        provider_result = vlm_provider.analyze(
             images=[{"data_url": normalized.data_url}],
             prompt=effective_prompt,
             detail=detail or settings.vision_default_detail,
         )
 
-        # Always return structured JSON
-        return format_structured_output(
-            summary=result,
+        analyze_result = VisionAnalyzeResult(
+            summary=provider_result.text,
             suggested_followups=[
                 {
                     "tool": "vision_crop_analyze",
@@ -238,10 +289,20 @@ def vision_analyze(
                 }
             ],
         )
-    except VisionMCPError:
-        raise
+        return make_envelope(
+            tool=tool,
+            result=analyze_result,
+            task=task,
+            model=model,
+            source=_build_source_meta(normalized, include_source_ref=include_source_ref),
+            raw_model_output=_provider_result_to_envelope_payload(
+                provider_result, include_raw=include_raw
+            ),
+        )
+    except VisionMCPError as e:
+        return e.to_envelope(tool=tool, task=task, model=model)
     except Exception as e:
-        return handle_exception(e)
+        return handle_exception(e, tool=tool, task=task, model=model)
 
 
 @mcp.tool(
@@ -252,15 +313,23 @@ def vision_analyze(
 )
 def vision_inspect(
     image_source: Annotated[str, "Image: URL, file path, data URL, or base64"],
+    include_source_ref: Annotated[bool, "Include a redacted `source_ref` (URL netloc+path or file basename) in the source block"] = False,
 ) -> str:
     """Return image metadata without calling VLM."""
+    tool = "vision_inspect"
     try:
+        normalized, _ = load_and_validate_image(image_source, require_bytes=True)
         metadata = get_image_metadata(image_source)
-        return json.dumps(metadata, ensure_ascii=False, indent=2)
-    except VisionMCPError:
-        raise
+        inspect_result = VisionInspectResult(**metadata)
+        return make_envelope(
+            tool=tool,
+            result=inspect_result,
+            source=_build_source_meta(normalized, include_source_ref=include_source_ref),
+        )
+    except VisionMCPError as e:
+        return e.to_envelope(tool=tool)
     except Exception as e:
-        return handle_exception(e)
+        return handle_exception(e, tool=tool)
 
 
 @mcp.tool(
@@ -280,8 +349,12 @@ def vision_crop_analyze(
     height: Annotated[float, "Height of crop region (0.0-1.0, normalized)"],
     prompt: Annotated[str, "What to look for in the cropped region"] = "请详细描述这个区域的内容",
     task: Annotated[str, "Task type: general/qa/ui/chart/document/object/screenshot/code_screenshot"] = "general",
+    include_raw: Annotated[bool, "Include the sanitized provider response in `raw_model_output`"] = False,
+    include_source_ref: Annotated[bool, "Include a redacted `source_ref` (URL netloc+path or file basename) in the source block"] = False,
 ) -> str:
     """Crop a region and analyze it."""
+    tool = "vision_crop_analyze"
+    model = vlm_provider.model_id
     try:
         validate_crop(x, y, width, height)
         validate_choice(task, TASK_TYPES, "task")
@@ -293,23 +366,30 @@ def vision_crop_analyze(
         effective_prompt = build_prompt(prompt, task)
         effective_prompt += f"\n\n[这是原图区域 x={x:.2f}, y={y:.2f}, w={width:.2f}, h={height:.2f} 的裁剪放大图]"
 
-        result = vlm_provider.analyze(
+        provider_result = vlm_provider.analyze(
             images=[{"data_url": cropped_data_url}],
             prompt=effective_prompt,
             detail="high",
         )
 
-        return format_structured_output(
-            summary=result,
-            observations=[{
-                "region": [x, y, width, height],
-                "description": result[:200],
-            }],
+        crop_result = VisionCropAnalyzeResult(
+            crop=CropRegion(x=x, y=y, width=width, height=height),
+            summary=provider_result.text,
         )
-    except VisionMCPError:
-        raise
+        return make_envelope(
+            tool=tool,
+            result=crop_result,
+            task=task,
+            model=model,
+            source=_build_source_meta(normalized, include_source_ref=include_source_ref),
+            raw_model_output=_provider_result_to_envelope_payload(
+                provider_result, include_raw=include_raw
+            ),
+        )
+    except VisionMCPError as e:
+        return e.to_envelope(tool=tool, task=task, model=model)
     except Exception as e:
-        return handle_exception(e)
+        return handle_exception(e, tool=tool, task=task, model=model)
 
 
 @mcp.tool(
@@ -325,8 +405,12 @@ def vision_extract_text(
     image_source: Annotated[str, "Image: URL, file path, data URL, or base64"],
     language: Annotated[str, "Expected language hint: chinese, english, japanese, korean, or auto"] = "auto",
     preserve_layout: Annotated[bool, "Try to preserve the original layout in the output"] = True,
+    include_raw: Annotated[bool, "Include the sanitized provider response in `raw_model_output`"] = False,
+    include_source_ref: Annotated[bool, "Include a redacted `source_ref` (URL netloc+path or file basename) in the source block"] = False,
 ) -> str:
     """Extract text from image using OCR model (with VLM fallback)."""
+    tool = "vision_extract_text"
+    model = vlm_provider.model_id
     try:
         validate_choice(language, OCR_LANGUAGES, "language")
         normalized, _ = load_and_validate_image(image_source, require_bytes=True)
@@ -341,23 +425,35 @@ def vision_extract_text(
             f"Do not invent text."
         )
 
+        def _make_extract_envelope(
+            text: str, *, warnings: list[str] | None = None
+        ) -> str:
+            extract_result = VisionExtractTextResult(
+                text=text,
+                blocks=[TextBlock(order=1, type="text", text=text)],
+            )
+            return make_envelope(
+                tool=tool,
+                result=extract_result,
+                model=model,
+                source=_build_source_meta(normalized, include_source_ref=include_source_ref),
+                warnings=warnings,
+            )
+
         # Try dedicated OCR provider first
         if ocr_provider:
             try:
-                result = ocr_provider.analyze(
+                ocr_result = ocr_provider.analyze(
                     images=[{"data_url": normalized.data_url}],
                     prompt=ocr_english_prompt,
                     detail="high",
                 )
-                if result and result.strip():
-                    return format_structured_output(
-                        summary=f"OCR text extraction completed ({settings.ocr_model_id})",
-                        extracted_text=[result],
-                    )
+                if ocr_result.text and ocr_result.text.strip():
+                    return _make_extract_envelope(ocr_result.text)
                 # Empty result - fall through to VLM
-            except Exception as ocr_err:
+            except Exception:
                 # Fall back to VLM with Chinese prompt
-                result = vlm_provider.analyze(
+                vlm_result = vlm_provider.analyze(
                     images=[{"data_url": normalized.data_url}],
                     prompt=(
                         f"请提取图片中的所有可见文字。{layout_hint}\n"
@@ -368,14 +464,13 @@ def vision_extract_text(
                     ),
                     detail="high",
                 )
-                return format_structured_output(
-                    summary=f"OCR model failed, used VLM fallback: {str(ocr_err)[:100]}",
-                    extracted_text=[result],
-                    uncertainties=["Extraction performed by VLM, not specialized OCR model"],
+                return _make_extract_envelope(
+                    vlm_result.text,
+                    warnings=["Dedicated OCR provider failed; used VLM fallback."],
                 )
 
         # No OCR provider or empty result - use VLM
-        result = vlm_provider.analyze(
+        vlm_result = vlm_provider.analyze(
             images=[{"data_url": normalized.data_url}],
             prompt=(
                 f"请提取图片中的所有可见文字。{layout_hint}\n"
@@ -386,14 +481,11 @@ def vision_extract_text(
             ),
             detail="high",
         )
-        return format_structured_output(
-            summary="Text extraction completed (VLM)",
-            extracted_text=[result],
-        )
-    except VisionMCPError:
-        raise
+        return _make_extract_envelope(vlm_result.text)
+    except VisionMCPError as e:
+        return e.to_envelope(tool=tool, model=model)
     except Exception as e:
-        return handle_exception(e)
+        return handle_exception(e, tool=tool, model=model)
 
 
 @mcp.tool(
@@ -410,8 +502,12 @@ def vision_compare(
     image_sources: Annotated[list[str], "2-4 image sources to compare (URLs, file paths, etc.)"],
     prompt: Annotated[str, "What to compare between the images"] = "请比较这些图片的异同",
     focus: Annotated[str, "Focus area: general/layout/text/colors/changes"] = "general",
+    include_raw: Annotated[bool, "Include the sanitized provider response in `raw_model_output`"] = False,
+    include_source_ref: Annotated[bool, "Include a redacted `source_ref` (URL netloc+path or file basename) in the source block for each input"] = False,
 ) -> str:
     """Compare multiple images and find differences."""
+    tool = "vision_compare"
+    model = vlm_provider.model_id
     try:
         validate_choice(focus, COMPARE_FOCUS_TYPES, "focus")
         if len(image_sources) < 2:
@@ -422,9 +518,13 @@ def vision_compare(
 
         # Normalize all images
         normalized_images = []
+        sources: list[SourceMeta] = []
         for src in image_sources:
             normalized, _ = load_and_validate_image(src)
             normalized_images.append({"data_url": normalized.data_url})
+            sources.append(
+                _build_source_meta(normalized, include_source_ref=include_source_ref)
+            )
 
         focus_hints = {
             "general": "比较所有方面的异同",
@@ -444,20 +544,26 @@ def vision_compare(
             f"用户关注：{prompt}"
         )
 
-        result = vlm_provider.analyze(
+        provider_result = vlm_provider.analyze(
             images=normalized_images,
             prompt=compare_prompt,
             detail="high",
         )
 
-        return format_structured_output(
-            summary="Image comparison completed",
-            observations=[{"comparison_result": result}],
+        compare_result = VisionCompareResult(summary=provider_result.text)
+        return make_envelope(
+            tool=tool,
+            result=compare_result,
+            model=model,
+            sources=sources,
+            raw_model_output=_provider_result_to_envelope_payload(
+                provider_result, include_raw=include_raw
+            ),
         )
-    except VisionMCPError:
-        raise
+    except VisionMCPError as e:
+        return e.to_envelope(tool=tool, model=model)
     except Exception as e:
-        return handle_exception(e)
+        return handle_exception(e, tool=tool, model=model)
 
 
 @mcp.tool(
@@ -468,40 +574,49 @@ def vision_compare(
 )
 def vision_capabilities() -> str:
     """Return server capabilities."""
-    capabilities = {
-        "server": "agent-vision-mcp",
-        "version": "0.0.2",
-        "vlm_provider": vlm_provider.get_capabilities(),
-        "ocr_provider": ocr_provider.get_capabilities() if ocr_provider else None,
-        "ocr_enabled": settings.ocr_enabled,
-        "tools": {
-            "vision_analyze": "Analyze image with structured output and task-specific prompts",
-            "vision_inspect": "Get image metadata without VLM",
-            "vision_crop_analyze": "Crop and analyze specific region (normalized coordinates 0-1)",
-            "vision_extract_text": "OCR text extraction (dedicated OCR model if configured)",
-            "vision_compare": "Compare 2-4 images for differences",
-            "vision_capabilities": "This tool - show server capabilities",
-        },
-        "supports": {
-            "url": True,
-            "local_file": settings.vision_allow_local_files,
-            "base64": True,
-            "data_url": True,
-            "crop": True,
-            "ocr": settings.ocr_enabled,
-            "multi_image_compare": True,
-        },
-        "limits": {
-            "max_image_size_mb": settings.vision_max_image_size_mb,
-            "max_image_pixels": settings.vision_max_image_pixels,
-            "max_batch_images": settings.vision_max_batch_images,
-            "max_compare_images": 4,
-            "timeout": settings.vision_timeout,
-            "url_mode": settings.vision_url_mode,
-        },
-        "task_types": list(TASK_PROMPTS.keys()),
-    }
-    return json.dumps(capabilities, ensure_ascii=False, indent=2)
+    tool = "vision_capabilities"
+    try:
+        capabilities = {
+            "server": "agent-vision-mcp",
+            "version": "0.0.2",
+            "vlm_provider": vlm_provider.get_capabilities(),
+            "ocr_provider": ocr_provider.get_capabilities() if ocr_provider else None,
+            "ocr_enabled": settings.ocr_enabled,
+            "tools": {
+                "vision_analyze": "Analyze image with structured output and task-specific prompts",
+                "vision_inspect": "Get image metadata without VLM",
+                "vision_crop_analyze": "Crop and analyze specific region (normalized coordinates 0-1)",
+                "vision_extract_text": "OCR text extraction (dedicated OCR model if configured)",
+                "vision_compare": "Compare 2-4 images for differences",
+                "vision_capabilities": "This tool - show server capabilities",
+            },
+            "supports": {
+                "url": True,
+                "local_file": settings.vision_allow_local_files,
+                "base64": True,
+                "data_url": True,
+                "crop": True,
+                "ocr": settings.ocr_enabled,
+                "multi_image_compare": True,
+            },
+            "limits": {
+                "max_image_size_mb": settings.vision_max_image_size_mb,
+                "max_image_pixels": settings.vision_max_image_pixels,
+                "max_batch_images": settings.vision_max_batch_images,
+                "max_compare_images": 4,
+                "timeout": settings.vision_timeout,
+                "url_mode": settings.vision_url_mode,
+            },
+            "task_types": list(TASK_PROMPTS.keys()),
+        }
+        return make_envelope(
+            tool=tool,
+            result=VisionCapabilitiesResult(**capabilities),
+        )
+    except VisionMCPError as e:
+        return e.to_envelope(tool=tool)
+    except Exception as e:
+        return handle_exception(e, tool=tool)
 
 
 def run_server():

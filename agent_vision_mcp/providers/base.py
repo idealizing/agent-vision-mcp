@@ -3,6 +3,8 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
+from agent_vision_mcp.provider_result import ProviderResult
+
 
 class BaseVisionProvider(ABC):
     """Abstract base class for vision providers"""
@@ -14,7 +16,7 @@ class BaseVisionProvider(ABC):
         prompt: str,
         detail: str = "auto",
         max_tokens: Optional[int] = None,
-    ) -> str:
+    ) -> ProviderResult:
         """
         Analyze images with a text prompt.
 
@@ -25,7 +27,9 @@ class BaseVisionProvider(ABC):
             max_tokens: Maximum tokens in response
 
         Returns:
-            Model's text response
+            Sanitized ProviderResult. Implementations must NOT leak raw
+            SDK internals (headers, request IDs, signed URLs) — use
+            `build_provider_result` from `agent_vision_mcp.provider_result`.
         """
         pass
 

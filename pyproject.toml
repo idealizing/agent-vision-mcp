@@ -20,7 +20,7 @@ dependencies = [
     "openai",
     "langchain-openai",
     "python-dotenv",
-    "pydantic",
+    "pydantic>=2.6,<3",
     "pillow",
     "httpx",
 ]
